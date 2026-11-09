@@ -1,16 +1,22 @@
-# Edit $Range and $Port, then paste this whole script into a
-# Windows PowerShell window. Input is not read from the keyboard,
-# so the paste cannot be swallowed by a prompt.
+# Two steps, in the same Windows PowerShell window.
 #
-# Nmap finds addresses with the SSH port open, then each of those
-# hosts is tried over SSH as the domain account you are already
-# signed in with (Kerberos / GSSAPI). No password is read or stored.
+# 1. Run nmap and keep the output on screen and in $NmapText.
+#    Change the range (and -p) to match $Port below.
 #
-# Needs: domain-joined Windows session, Nmap on PATH, OpenSSH Client,
+#    nmap -n -Pn -T4 -p 22 --open -oG - 10.1.10.1-20 | Tee-Object -Variable NmapText
+#
+# 2. Paste this whole script. It does not scan. It reads $NmapText
+#    and tries SSH only to hosts nmap reported with that port open.
+#    Nothing is read from the keyboard, so the paste cannot be
+#    swallowed by a prompt.
+#
+# Each host is tried as the domain account you are already signed
+# in with (Kerberos / GSSAPI). No password is read or stored.
+#
+# Needs: domain-joined Windows session, OpenSSH Client (ssh),
 # and SSH servers that accept GSSAPI for that account.
 # Check the ticket first with: klist
 
-$Range = '10.1.10.1-10.1.10.20'   # start-end, CIDR (/22 to /32), or one IP
 $Port = 22
 
 $ErrorActionPreference = 'Continue'
@@ -27,10 +33,6 @@ if (-not $env:USERDOMAIN -or $env:USERDOMAIN -eq $env:COMPUTERNAME) {
 if (-not (Get-Command ssh.exe -ErrorAction SilentlyContinue)) {
     throw 'OpenSSH Client is not installed (ssh.exe was not found).'
 }
-$nmapCmd = @(Get-Command nmap.exe, nmap -ErrorAction SilentlyContinue) | Select-Object -First 1
-if (-not $nmapCmd) {
-    throw 'nmap was not found. Install Nmap and ensure it is on PATH.'
-}
 
 $klist = & klist.exe 2>&1 | Out-String
 if ($klist -notmatch 'krbtgt/') {
@@ -39,61 +41,37 @@ if ($klist -notmatch 'krbtgt/') {
 
 $timeoutSec = 5
 
-function ConvertTo-UInt32IP {
-    param([string]$Ip)
-    $bytes = [System.Net.IPAddress]::Parse($Ip.Trim()).GetAddressBytes()
-    if ($bytes.Length -ne 4) { throw "Not an IPv4 address: $Ip" }
-    [Array]::Reverse($bytes)
-    return [uint64][BitConverter]::ToUInt32($bytes, 0)
-}
+function Get-OpenHostsFromNmap {
+    param($Text, [int]$Port)
+    $hosts = New-Object System.Collections.Generic.List[string]
+    $current = $null
+    $ipRe = '\d{1,3}(?:\.\d{1,3}){3}'
 
-function ConvertFrom-UInt32IP {
-    param([uint64]$Value)
-    $bytes = [BitConverter]::GetBytes([uint32]$Value)
-    [Array]::Reverse($bytes)
-    return ([System.Net.IPAddress]::new($bytes)).ToString()
-}
-
-function Get-IPRangeList {
-    param([string]$Spec)
-    $spec = $Spec.Trim()
-    $max = 1024
-
-    if ($spec -match '^(?<a>\d{1,3}(\.\d{1,3}){3})\s*-\s*(?<b>\d{1,3}(\.\d{1,3}){3})$') {
-        $start = ConvertTo-UInt32IP $Matches.a
-        $end = ConvertTo-UInt32IP $Matches.b
-        if ($end -lt $start) { throw 'End IP is lower than start IP.' }
-        $count = $end - $start + 1
-        if ($count -gt $max) { throw "That range has $count addresses. Use 1024 or fewer." }
-        $i = $start
-        while ($true) {
-            ConvertFrom-UInt32IP $i
-            if ($i -ge $end) { break }
-            $i++
+    foreach ($raw in @($Text)) {
+        foreach ($line in ("$raw" -split "`r?`n")) {
+            # Grepable line (-oG): Host: 10.1.10.5 () Ports: 22/open/tcp//ssh///
+            if ($line -match "^Host:\s+($ipRe)\b") {
+                $ip = $Matches[1]
+                $current = $null
+                if ($line -match "\b$Port/open/") { $hosts.Add($ip) }
+                continue
+            }
+            # Normal line: Nmap scan report for 10.1.10.5
+            #          or: Nmap scan report for name (10.1.10.5)
+            if ($line -match '^Nmap scan report for\s+(.+?)\s*$') {
+                $rest = $Matches[1].Trim()
+                if ($rest -match "\(($ipRe)\)") { $current = $Matches[1] }
+                elseif ($rest -match "^($ipRe)$") { $current = $Matches[1] }
+                else { $current = ($rest -split '\s+')[0] }
+                continue
+            }
+            if ($current -and $line -match "^\s*$Port/tcp\s+open\b") {
+                $hosts.Add($current)
+                $current = $null
+            }
         }
-        return
     }
-
-    if ($spec -match '^(?<a>\d{1,3}(\.\d{1,3}){3})/(?<p>\d{1,2})$') {
-        $prefix = [int]$Matches.p
-        if ($prefix -lt 22 -or $prefix -gt 32) {
-            throw 'CIDR must be /22 through /32 (1024 addresses or fewer).'
-        }
-        $ip = ConvertTo-UInt32IP $Matches.a
-        $hostBits = 32 - $prefix
-        $size = [uint64]1 -shl $hostBits
-        $mask = (([uint64]4294967295) -shr $hostBits) -shl $hostBits
-        $network = $ip -band $mask
-        for ($i = [uint64]0; $i -lt $size; $i++) { ConvertFrom-UInt32IP ($network + $i) }
-        return
-    }
-
-    if ($spec -match '^\d{1,3}(\.\d{1,3}){3}$') {
-        ConvertFrom-UInt32IP (ConvertTo-UInt32IP $spec)
-        return
-    }
-
-    throw 'Use start-end (10.1.10.1-10.1.10.50), CIDR (10.1.10.0/24), or a single IP.'
+    return @($hosts | Select-Object -Unique)
 }
 
 function Invoke-AdSshLogin {
@@ -134,61 +112,44 @@ function Invoke-AdSshLogin {
     return [pscustomobject]@{ Ok = $false; Detail = $text }
 }
 
+$nmapVar = Get-Variable -Name NmapText -ErrorAction SilentlyContinue
+if (-not $nmapVar) {
+    throw @"
+No nmap output in `$NmapText. In this same window, run nmap first:
+
+  nmap -n -Pn -T4 -p $Port --open -oG - 10.1.10.1-20 | Tee-Object -Variable NmapText
+
+Use your range in place of 10.1.10.1-20, then paste this script again.
+"@
+}
+
 $user = $env:USERNAME
-$allIps = @(Get-IPRangeList $Range)
-$knownHosts = Join-Path $env:TEMP 'ssh-ad-range-known_hosts'
-$targetFile = Join-Path $env:TEMP 'ssh-ad-range-targets.txt'
-$nmapErrFile = Join-Path $env:TEMP 'ssh-ad-range-nmap.err'
-$openPattern = "^Host:\s+(\d{1,3}(?:\.\d{1,3}){3})\b.*\b$Port/open/"
-
-Write-Host "Scanning $($allIps.Count) address(es) for TCP $Port as $env:USERDOMAIN\$user"
-Set-Content -Path $targetFile -Value $allIps -Encoding ascii
-
-$openIps = New-Object System.Collections.Generic.List[string]
-$nmapExit = 0
-try {
-    # -Pn checks every address, including hosts that do not answer ping.
-    # stderr goes to a file so PowerShell does not treat Nmap's progress as errors.
-    $nmapArgs = @('-n', '-Pn', '-T4', '-p', "$Port", '--open', '-oG', '-', '-iL', $targetFile)
-    $nmapOutput = & $nmapCmd.Source @nmapArgs 2>$nmapErrFile
-    $nmapExit = $LASTEXITCODE
-    foreach ($line in @($nmapOutput)) {
-        if ("$line" -match $openPattern) {
-            $openIps.Add($Matches[1])
-            Write-Host "  open  $($Matches[1])" -ForegroundColor Green
-        }
-    }
-} finally {
-    Remove-Item -LiteralPath $targetFile -ErrorAction SilentlyContinue
-}
-
-if ($nmapExit -and $nmapExit -ne 0) {
-    Write-Warning "nmap exited with code $nmapExit."
-    if (Test-Path -LiteralPath $nmapErrFile) {
-        Get-Content -LiteralPath $nmapErrFile | Write-Host
-    }
-}
-Remove-Item -LiteralPath $nmapErrFile -ErrorAction SilentlyContinue
-
-$ips = @($openIps | Select-Object -Unique)
+$ips = @(Get-OpenHostsFromNmap -Text $nmapVar.Value -Port $Port)
 if ($ips.Count -eq 0) {
-    Write-Host "No hosts have TCP $Port open."
-} else {
-    Write-Host "SSH login to $($ips.Count) host(s) on port $Port as $env:USERDOMAIN\$user"
-    Write-Host "Host keys are stored in $knownHosts"
-
-    $results = foreach ($ip in $ips) {
-        Write-Host $ip
-        $login = Invoke-AdSshLogin -Ip $ip -Port $Port -User $user -TimeoutSec $timeoutSec -KnownHosts $knownHosts
-        if ($login.Ok) {
-            Write-Host "  login ok  $($login.Detail)" -ForegroundColor Green
-        } else {
-            Write-Host "  login failed  $($login.Detail)" -ForegroundColor Yellow
-        }
-        [pscustomobject]@{ IP = $ip; Login = $login.Ok; Result = $login.Detail }
-    }
-
-    $results | Format-Table -AutoSize -Wrap
-    $loggedIn = @($results | Where-Object Login).Count
-    Write-Host ("Done. Nmap found {0} host(s) with TCP {1} open, {2} accepted the current AD login." -f $ips.Count, $Port, $loggedIn)
+    Write-Host "No hosts in the nmap output have TCP $Port open."
+    Write-Host "Use grepable output: nmap -n -Pn -T4 -p $Port --open -oG - <range> | Tee-Object -Variable NmapText"
+    return
 }
+if ($ips.Count -gt 1024) {
+    throw "Nmap reported $($ips.Count) open hosts. Use a smaller range (1024 or fewer)."
+}
+
+$knownHosts = Join-Path $env:TEMP 'ssh-ad-range-known_hosts'
+Write-Host "SSH login to $($ips.Count) host(s) on port $Port as $env:USERDOMAIN\$user"
+Write-Host "Host keys are stored in $knownHosts"
+foreach ($ip in $ips) { Write-Host "  open  $ip" -ForegroundColor Green }
+
+$results = foreach ($ip in $ips) {
+    Write-Host $ip
+    $login = Invoke-AdSshLogin -Ip $ip -Port $Port -User $user -TimeoutSec $timeoutSec -KnownHosts $knownHosts
+    if ($login.Ok) {
+        Write-Host "  login ok  $($login.Detail)" -ForegroundColor Green
+    } else {
+        Write-Host "  login failed  $($login.Detail)" -ForegroundColor Yellow
+    }
+    [pscustomobject]@{ IP = $ip; Login = $login.Ok; Result = $login.Detail }
+}
+
+$results | Format-Table -AutoSize -Wrap
+$loggedIn = @($results | Where-Object Login).Count
+Write-Host ("Done. Nmap listed {0} host(s) with TCP {1} open, {2} accepted the current AD login." -f $ips.Count, $Port, $loggedIn)
