@@ -1,26 +1,10 @@
-# Two steps, in the same Windows PowerShell window.
-#
-# 1. Run nmap and keep the output on screen and in $NmapText.
-#    Change the range (and -p) to match $Port below.
-#
-#    nmap -n -Pn -T4 -p 22 --open -oG - 10.1.10.1-20 | Tee-Object -Variable NmapText
-#
-# 2. Paste this whole script. It does not scan. It reads $NmapText
-#    and tries SSH only to hosts nmap reported with that port open.
-#    Nothing is read from the keyboard, so the paste cannot be
-#    swallowed by a prompt.
-#
-# Each host is tried as the domain account you are already signed
-# in with (Kerberos / GSSAPI). No password is read or stored.
-#
-# Needs: domain-joined Windows session, OpenSSH Client (ssh),
-# and SSH servers that accept GSSAPI for that account.
-# Check the ticket first with: klist
+& {
+# nmap -n -Pn -T4 -p 22 --open -oG - 10.1.10.1-20 | Tee-Object -Variable NmapText
 
 $Port = 22
 
 $ErrorActionPreference = 'Continue'
-if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue) {
     $PSNativeCommandUseErrorActionPreference = $false
 }
 
@@ -49,15 +33,12 @@ function Get-OpenHostsFromNmap {
 
     foreach ($raw in @($Text)) {
         foreach ($line in ("$raw" -split "`r?`n")) {
-            # Grepable line (-oG): Host: 10.1.10.5 () Ports: 22/open/tcp//ssh///
             if ($line -match "^Host:\s+($ipRe)\b") {
                 $ip = $Matches[1]
                 $current = $null
                 if ($line -match "\b$Port/open/") { $hosts.Add($ip) }
                 continue
             }
-            # Normal line: Nmap scan report for 10.1.10.5
-            #          or: Nmap scan report for name (10.1.10.5)
             if ($line -match '^Nmap scan report for\s+(.+?)\s*$') {
                 $rest = $Matches[1].Trim()
                 if ($rest -match "\(($ipRe)\)") { $current = $Matches[1] }
@@ -112,22 +93,15 @@ function Invoke-AdSshLogin {
     return [pscustomobject]@{ Ok = $false; Detail = $text }
 }
 
-$nmapVar = Get-Variable -Name NmapText -ErrorAction SilentlyContinue
+$nmapVar = Get-Variable -Name NmapText -Scope Global -ErrorAction SilentlyContinue
 if (-not $nmapVar) {
-    throw @"
-No nmap output in `$NmapText. In this same window, run nmap first:
-
-  nmap -n -Pn -T4 -p $Port --open -oG - 10.1.10.1-20 | Tee-Object -Variable NmapText
-
-Use your range in place of 10.1.10.1-20, then paste this script again.
-"@
+    throw "No nmap output in `$NmapText. Run nmap first, then paste this script again."
 }
 
 $user = $env:USERNAME
 $ips = @(Get-OpenHostsFromNmap -Text $nmapVar.Value -Port $Port)
 if ($ips.Count -eq 0) {
     Write-Host "No hosts in the nmap output have TCP $Port open."
-    Write-Host "Use grepable output: nmap -n -Pn -T4 -p $Port --open -oG - <range> | Tee-Object -Variable NmapText"
     return
 }
 if ($ips.Count -gt 1024) {
@@ -153,3 +127,4 @@ $results = foreach ($ip in $ips) {
 $results | Format-Table -AutoSize -Wrap
 $loggedIn = @($results | Where-Object Login).Count
 Write-Host ("Done. Nmap listed {0} host(s) with TCP {1} open, {2} accepted the current AD login." -f $ips.Count, $Port, $loggedIn)
+}
