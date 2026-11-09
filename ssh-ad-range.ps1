@@ -2,11 +2,11 @@
 # Windows PowerShell window. Input is not read from the keyboard,
 # so the paste cannot be swallowed by a prompt.
 #
-# Each address is tried over SSH as the domain account you are
-# already signed in with (Kerberos / GSSAPI). No password is read
-# or stored.
+# Nmap finds addresses with the SSH port open, then each of those
+# hosts is tried over SSH as the domain account you are already
+# signed in with (Kerberos / GSSAPI). No password is read or stored.
 #
-# Needs: domain-joined Windows session, OpenSSH Client (ssh),
+# Needs: domain-joined Windows session, Nmap on PATH, OpenSSH Client,
 # and SSH servers that accept GSSAPI for that account.
 # Check the ticket first with: klist
 
@@ -26,6 +26,10 @@ if (-not $env:USERDOMAIN -or $env:USERDOMAIN -eq $env:COMPUTERNAME) {
 }
 if (-not (Get-Command ssh.exe -ErrorAction SilentlyContinue)) {
     throw 'OpenSSH Client is not installed (ssh.exe was not found).'
+}
+$nmapCmd = @(Get-Command nmap.exe, nmap -ErrorAction SilentlyContinue) | Select-Object -First 1
+if (-not $nmapCmd) {
+    throw 'nmap was not found. Install Nmap and ensure it is on PATH.'
 }
 
 $klist = & klist.exe 2>&1 | Out-String
@@ -92,21 +96,6 @@ function Get-IPRangeList {
     throw 'Use start-end (10.1.10.1-10.1.10.50), CIDR (10.1.10.0/24), or a single IP.'
 }
 
-function Test-TcpPort {
-    param([string]$Ip, [int]$Port, [int]$TimeoutMs)
-    $client = New-Object System.Net.Sockets.TcpClient
-    try {
-        $wait = $client.BeginConnect($Ip, $Port, $null, $null)
-        if (-not $wait.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return $false }
-        $client.EndConnect($wait)
-        return [bool]$client.Connected
-    } catch {
-        return $false
-    } finally {
-        try { $client.Close() } catch { }
-    }
-}
-
 function Invoke-AdSshLogin {
     param(
         [string]$Ip,
@@ -146,30 +135,60 @@ function Invoke-AdSshLogin {
 }
 
 $user = $env:USERNAME
-$ips = @(Get-IPRangeList $Range)
+$allIps = @(Get-IPRangeList $Range)
 $knownHosts = Join-Path $env:TEMP 'ssh-ad-range-known_hosts'
-Write-Host "Trying $($ips.Count) address(es) on port $Port as $env:USERDOMAIN\$user"
-Write-Host "Host keys are stored in $knownHosts"
+$targetFile = Join-Path $env:TEMP 'ssh-ad-range-targets.txt'
+$nmapErrFile = Join-Path $env:TEMP 'ssh-ad-range-nmap.err'
+$openPattern = "^Host:\s+(\d{1,3}(?:\.\d{1,3}){3})\b.*\b$Port/open/"
 
-$results = foreach ($ip in $ips) {
-    Write-Host $ip
-    $portOpen = Test-TcpPort -Ip $ip -Port $Port -TimeoutMs 1500
-    if (-not $portOpen) {
-        Write-Host '  port closed' -ForegroundColor DarkGray
-        [pscustomobject]@{ IP = $ip; PortOpen = $false; Login = $false; Result = 'port closed' }
-        continue
-    }
+Write-Host "Scanning $($allIps.Count) address(es) for TCP $Port as $env:USERDOMAIN\$user"
+Set-Content -Path $targetFile -Value $allIps -Encoding ascii
 
-    $login = Invoke-AdSshLogin -Ip $ip -Port $Port -User $user -TimeoutSec $timeoutSec -KnownHosts $knownHosts
-    if ($login.Ok) {
-        Write-Host "  login ok  $($login.Detail)" -ForegroundColor Green
-    } else {
-        Write-Host "  login failed  $($login.Detail)" -ForegroundColor Yellow
+$openIps = New-Object System.Collections.Generic.List[string]
+$nmapExit = 0
+try {
+    # -Pn checks every address, including hosts that do not answer ping.
+    # stderr goes to a file so PowerShell does not treat Nmap's progress as errors.
+    $nmapArgs = @('-n', '-Pn', '-T4', '-p', "$Port", '--open', '-oG', '-', '-iL', $targetFile)
+    $nmapOutput = & $nmapCmd.Source @nmapArgs 2>$nmapErrFile
+    $nmapExit = $LASTEXITCODE
+    foreach ($line in @($nmapOutput)) {
+        if ("$line" -match $openPattern) {
+            $openIps.Add($Matches[1])
+            Write-Host "  open  $($Matches[1])" -ForegroundColor Green
+        }
     }
-    [pscustomobject]@{ IP = $ip; PortOpen = $true; Login = $login.Ok; Result = $login.Detail }
+} finally {
+    Remove-Item -LiteralPath $targetFile -ErrorAction SilentlyContinue
 }
 
-$results | Format-Table -AutoSize -Wrap
-$loggedIn = @($results | Where-Object Login).Count
-$reachable = @($results | Where-Object PortOpen).Count
-Write-Host ("Done. {0} addresses, {1} had port {2} open, {3} accepted the current AD login." -f $results.Count, $reachable, $Port, $loggedIn)
+if ($nmapExit -and $nmapExit -ne 0) {
+    Write-Warning "nmap exited with code $nmapExit."
+    if (Test-Path -LiteralPath $nmapErrFile) {
+        Get-Content -LiteralPath $nmapErrFile | Write-Host
+    }
+}
+Remove-Item -LiteralPath $nmapErrFile -ErrorAction SilentlyContinue
+
+$ips = @($openIps | Select-Object -Unique)
+if ($ips.Count -eq 0) {
+    Write-Host "No hosts have TCP $Port open."
+} else {
+    Write-Host "SSH login to $($ips.Count) host(s) on port $Port as $env:USERDOMAIN\$user"
+    Write-Host "Host keys are stored in $knownHosts"
+
+    $results = foreach ($ip in $ips) {
+        Write-Host $ip
+        $login = Invoke-AdSshLogin -Ip $ip -Port $Port -User $user -TimeoutSec $timeoutSec -KnownHosts $knownHosts
+        if ($login.Ok) {
+            Write-Host "  login ok  $($login.Detail)" -ForegroundColor Green
+        } else {
+            Write-Host "  login failed  $($login.Detail)" -ForegroundColor Yellow
+        }
+        [pscustomobject]@{ IP = $ip; Login = $login.Ok; Result = $login.Detail }
+    }
+
+    $results | Format-Table -AutoSize -Wrap
+    $loggedIn = @($results | Where-Object Login).Count
+    Write-Host ("Done. Nmap found {0} host(s) with TCP {1} open, {2} accepted the current AD login." -f $ips.Count, $Port, $loggedIn)
+}
