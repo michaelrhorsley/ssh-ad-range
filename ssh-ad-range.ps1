@@ -1,5 +1,5 @@
 & {
-# nmap -n -Pn -T4 -p 22 --open -oG - 10.1.10.1-20 | Tee-Object -Variable NmapText
+# nmap -n -Pn -T4 -p 22 --open -oN - -oG "$env:TEMP\ssh-ad-range.gnmap" 10.1.10.1-20
 
 $Port = 22
 
@@ -93,13 +93,13 @@ function Invoke-AdSshLogin {
     return [pscustomobject]@{ Ok = $false; Detail = $text }
 }
 
-$nmapVar = Get-Variable -Name NmapText -Scope Global -ErrorAction SilentlyContinue
-if (-not $nmapVar) {
-    throw "No nmap output in `$NmapText. Run nmap first, then paste this script again."
+$nmapFile = Join-Path $env:TEMP 'ssh-ad-range.gnmap'
+if (-not (Test-Path -LiteralPath $nmapFile)) {
+    throw "No nmap output at $nmapFile. Run nmap first, then paste this script again."
 }
 
 $user = $env:USERNAME
-$ips = @(Get-OpenHostsFromNmap -Text $nmapVar.Value -Port $Port)
+$ips = @(Get-OpenHostsFromNmap -Text (Get-Content -LiteralPath $nmapFile) -Port $Port)
 if ($ips.Count -eq 0) {
     Write-Host "No hosts in the nmap output have TCP $Port open."
     return
